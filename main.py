@@ -7,7 +7,7 @@ import os
 from datetime import datetime
 import tkinter 
 import random
-
+import webserver
  
 
 load_dotenv()
@@ -57,6 +57,8 @@ async def help(ctx):
     commands_list = [
         ("hello", "Greets the user."),
         ("list_commands", "Shows this list of commands."),
+        ("assign [role] [user]", "Assigns a role to you (requires permission)."),
+        ("remove [role] [user]", "Removes a role from you (requires permission)."),
         ("list_roles", "Lists all server roles."),
         ("secret", f"Access restricted to users with the '{server_role}' role."),
         ("dm [message]", "DMs you the message."),
@@ -67,6 +69,7 @@ async def help(ctx):
         ("serverinfo", "Displays server information."),
         ("flip", "Flips a coin (Heads or Tails)."),
         ("random_number", "Pick a number from 1 - 100."),
+        ("tictactoe @user1 @user2", "Starts a game of Tic-Tac-Toe.")
     ]
 
     embed = discord.Embed(
@@ -81,6 +84,53 @@ async def help(ctx):
     embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.avatar.url)
     await ctx.send(embed=embed)
 
+@bot.command()
+@commands.has_permissions(manage_roles=True)  
+async def assign(ctx, *, role_name: str):
+    roles = ctx.guild.roles  
+    target_role = discord.utils.get(roles, name=role_name)
+
+    if not target_role:
+        await ctx.send(f"❌ Role '{role_name}' does not exist.")
+        return
+
+    # Check if the bot can assign this role
+    if target_role >= ctx.guild.me.top_role:
+        await ctx.send("⚠️ I don't have permission to assign that role.")
+        return
+    
+    await ctx.author.add_roles(target_role)
+    await ctx.send(f"✅ {ctx.author.mention} has been assigned the role '{target_role.name}'.")
+
+
+@bot.command()
+@commands.has_permissions(manage_roles=True)  
+async def remove(ctx, user: discord.Member = None, *, role_name: str = None, ):
+
+    if user is None:
+        await ctx.send("You need to specify a user")
+    
+    if role_name is None:
+        await ctx.send("You need to specify the role name")
+
+    roles = ctx.guild.roles  
+    target_role = discord.utils.get(roles, name=role_name)
+
+    if not target_role:
+        await ctx.send(f"Role doesn't exist")
+        return
+    
+    if target_role not in user.roles:
+        await ctx.send(f"⚠️ {user.mention} doesn't have the '{role_name}' role.")
+        return 
+    
+    try:
+        await user.remove_roles(target_role)
+        await ctx.send(f"✅ Removed role '{role_name}' from {user.mention}.")
+    except discord.Forbidden:
+        await ctx.send("❌ I do not have permission to remove that role.")
+    except Exception as e:
+        await ctx.send(f"⚠️ An error occurred: {e}")
 
 
 
@@ -203,7 +253,21 @@ async def ban(ctx, *, banned : discord.Member):
         await ctx.send(f"⚠️ An error occurred: {str(e)}")
 
 
+@bot.command()
+@commands.has_permissions(ban_members=True)
+async def banned(ctx):
+    if ctx.author != ctx.guild.owner:
+        await ctx.send("❌ Only the **server owner** can view the ban list.")
+        return
 
+    bans = await ctx.guild.bans()
+    
+    if not bans:
+        await ctx.send("✅ No users are currently banned.")
+        return
+
+    pretty_list = ["• {0.id} ({0.name}#{0.discriminator})".format(entry.user) for entry in bans]
+    await ctx.send("**Ban list:**\n{}".format("\n".join(pretty_list)))
 
 
 
@@ -283,6 +347,108 @@ async def invite(ctx: commands.Context):
 
 
 
+class TicButton(discord.ui.Button):
+    def __init__(self, index):
+        super().__init__(
+            style=discord.ButtonStyle.grey,
+            label="⬜",
+            row=index // 3
+        )
+        self.index = index
+
+    async def callback(self, interaction: discord.Interaction):
+        # Only allow current turn player to click
+        if interaction.user != self.view.current_turn:
+            await interaction.response.send_message("It's not your turn!", ephemeral=True)
+            return
+
+        # Update the board state
+        if self.view.current_turn == self.view.players[0]:
+            self.label = self.view.labels[0]  # ❌
+            self.view.board[self.index] = self.view.labels[0]
+        else:
+            self.label = self.view.labels[1]  # ⭕
+            self.view.board[self.index] = self.view.labels[1]
+
+        self.disabled = True
+
+        # Check for win
+        result = check_winner(self.view.board, self.label)
+
+        if result == "win":
+            self.view.disable_all_items()
+            await interaction.response.edit_message(view=self.view)
+            await interaction.followup.send(f"🎉 {interaction.user.mention} wins! Game over.", ephemeral=False)
+            return
+
+        elif result == "draw":
+            self.view.disable_all_items()
+            await interaction.response.edit_message(view=self.view)
+            await interaction.followup.send("🤝 It's a draw! No more moves left.", ephemeral=False)
+            return
+
+
+        # Switch turn
+        self.view.current_turn = (
+            self.view.players[1]
+            if self.view.current_turn == self.view.players[0]
+            else self.view.players[0]
+        )
+
+        # Update message
+        await interaction.response.edit_message(view=self.view)
+        await interaction.followup.send(
+            f"{self.view.current_turn.mention}, it's your turn!", ephemeral=False
+        )
+
+class Board(discord.ui.View):
+    def __init__(self, players, labels, current_turn):
+        super().__init__(timeout=None)
+        self.players = players
+        self.labels = labels
+        self.current_turn = current_turn
+        self.board = ["⬜"] * 9  # 3x3 board
+
+        for i in range(9):
+            self.add_item(TicButton(i))
+
+    def disable_all_items(self):
+        for item in self.children:
+            item.disabled = True
+
+
+def check_winner(board, mark):
+    win_conditions = [
+        [0, 1, 2], [3, 4, 5], [6, 7, 8],  # Rows
+        [0, 3, 6], [1, 4, 7], [2, 5, 8],  # Columns
+        [0, 4, 8], [2, 4, 6]              # Diagonals
+    ]
+
+    for condition in win_conditions:
+        if all(board[i] == mark for i in condition):
+            return "win"
+
+    if all(cell != "⬜" for cell in board):
+        return "draw"
+
+    return None
+
+
+@bot.command()
+async def tictactoe(ctx, p2: discord.Member = None):
+    if p2 is None:
+        await ctx.send("You need to tag a friend to play")
+        return
+
+    players = (ctx.author, p2)
+    labels = ("❌", "⭕")
+    current_turn = random.choice(players)
+
+    view = Board(players=players, labels=labels, current_turn=current_turn)
+    await ctx.send(f"🎮 Tic-Tac-Toe started by {ctx.author.mention} with {p2.mention}!", view=view)
+    await ctx.send(f"🕹️ It's {current_turn.mention}'s turn!")
+
+
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingRequiredArgument):
@@ -300,6 +466,6 @@ async def on_command_error(ctx, error):
         await ctx.send("⚠️ An unexpected error occurred.")
         raise error  
 
-
+webserver.keep_alive()
 bot.run(token, log_handler=handler, log_level=logging.DEBUG)
 
